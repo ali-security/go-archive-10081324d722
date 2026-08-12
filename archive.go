@@ -965,12 +965,12 @@ func (t *Tarballer) Do() {
 	}
 }
 
-// unpackedDir records a directory whose mtime must be restored after all
-// entries are extracted, along with the root-relative entry name used during
-// extraction.
+// unpackedDir records a directory whose times must be restored after all
+// entries are extracted.
 type unpackedDir struct {
-	hdr  *tar.Header
-	name string // root-relative entry name
+	name  string // root-relative entry name
+	atime time.Time
+	mtime time.Time
 }
 
 // Unpack unpacks the decompressedArchive to dest with options.
@@ -1096,13 +1096,16 @@ loop:
 		// Directory mtimes must be handled at the end to avoid further
 		// file creation in them to modify the directory mtime
 		if hdr.Typeflag == tar.TypeDir {
-			dirs = append(dirs, unpackedDir{hdr: hdr, name: dstPath})
+			dirs = append(dirs, unpackedDir{
+				name:  dstPath,
+				atime: boundTime(latestTime(hdr.AccessTime, hdr.ModTime)),
+				mtime: boundTime(hdr.ModTime),
+			})
 		}
 	}
 
 	for _, d := range dirs {
-		aTime := boundTime(latestTime(d.hdr.AccessTime, d.hdr.ModTime))
-		if err := chtimes(root, d.name, aTime, boundTime(d.hdr.ModTime)); err != nil {
+		if err := chtimes(root, d.name, d.atime, d.mtime); err != nil {
 			return err
 		}
 	}
