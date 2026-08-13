@@ -454,7 +454,8 @@ func (ta *tarAppender) addTarFile(srcPath, archivePath string) error {
 }
 
 type resolvedArchivePath struct {
-	path string
+	path             string
+	parentWasPresent bool
 }
 
 // resolveArchivePath resolves intermediate symlinks in name using chroot-like
@@ -470,13 +471,17 @@ type resolvedArchivePath struct {
 // Paths with missing components are supported. Existing symlinks are resolved,
 // and any remaining nonexistent components are retained for later creation.
 //
+// The result records whether this resolution observed the parent directory.
+// Callers may use that observation to avoid a duplicate check for this entry,
+// but must not reuse it for later entries.
+//
 // This helper should eventually be replaced by handle-relative resolution and
 // operations with resolve-in-root semantics, avoiding the resolution/use race
 // and repeated path traversal.
 func resolveArchivePath(root *os.Root, name string) (resolvedArchivePath, error) {
 	parent, base := filepath.Split(name)
 	if parent == "" {
-		return resolvedArchivePath{path: name}, nil
+		return resolvedArchivePath{path: name, parentWasPresent: true}, nil
 	}
 
 	parent = filepath.Clean(parent)
@@ -486,7 +491,7 @@ func resolveArchivePath(root *os.Root, name string) (resolvedArchivePath, error)
 	_, statErr := root.Stat(parent)
 	switch {
 	case statErr == nil:
-		return resolvedArchivePath{path: name}, nil
+		return resolvedArchivePath{path: name, parentWasPresent: true}, nil
 	case !os.IsNotExist(statErr) && !isPathEscapes(statErr):
 		return resolvedArchivePath{}, statErr
 	}
@@ -1084,7 +1089,7 @@ loop:
 		//
 		// This must be done before whiteoutConverter.ConvertRead, which
 		// may set xattrs on the directory or create whiteout files.
-		if err := createImpliedDirectories(root, dstPath, options); err != nil {
+		if err := createImpliedDirectories(root, resolvedPath, options); err != nil {
 			return err
 		}
 
@@ -1145,15 +1150,14 @@ func unrepresentableOnWindows(hdr *tar.Header) error {
 // by file paths, without corresponding directory headers from which metadata
 // could be restored.
 //
-// The caller must pass a normalized, root-relative local path. Any archive-path
-// conversion and resolve-in-root handling must already have been applied.
+// The caller must pass the result of resolving the current archive entry.
 // Directory creation is performed through root, so it remains confined to the
 // extraction destination even if the destination tree changes concurrently.
-func createImpliedDirectories(root *os.Root, dstPath string, options *TarOptions) error {
-	parent := filepath.Dir(dstPath)
+func createImpliedDirectories(root *os.Root, resolved resolvedArchivePath, options *TarOptions) error {
+	parent := filepath.Dir(resolved.path)
 
 	// Skip when the parent is the root itself; nothing to create.
-	if parent == "." || parent == "" {
+	if parent == "." || parent == "" || resolved.parentWasPresent {
 		return nil
 	}
 	if _, err := root.Lstat(parent); err == nil {

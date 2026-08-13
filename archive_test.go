@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/moby/sys/user"
@@ -695,6 +696,33 @@ func prepareUntarSourceDirectory(numberOfFiles int, targetPath string, makeLinks
 	return totalSize, nil
 }
 
+func BenchmarkUnpackManyFilesSameParent(b *testing.B) {
+	const files = 4096
+
+	tarData := makeTarWithFiles(b, "dir/subdir", files)
+	target := filepath.Join(b.TempDir(), "dest")
+	options := &TarOptions{NoLchown: true}
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(tarData)))
+	b.ResetTimer()
+	for range b.N {
+		b.StopTimer()
+		if err := os.RemoveAll(target); err != nil {
+			b.Fatal(err)
+		}
+		if err := os.Mkdir(target, 0o755); err != nil {
+			b.Fatal(err)
+		}
+		r := bytes.NewReader(tarData)
+		b.StartTimer()
+
+		if err := Unpack(r, target, options); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkTarUntar(b *testing.B) {
 	origin, err := os.MkdirTemp(b.TempDir(), "docker-test-untar-origin")
 	if err != nil {
@@ -854,6 +882,133 @@ func TestUntarSiblingPrefixContained(t *testing.T) {
 	// No hardlink to the sibling's secret may be created inside dest.
 	_, statErr := os.Stat(filepath.Join(dest, "grab"))
 	assert.ErrorIs(t, statErr, os.ErrNotExist, "hardlink to prefix-sibling created")
+}
+
+func TestApplyLayerImpliedDirAfterWhiteout(t *testing.T) {
+	dest := t.TempDir()
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	writeFile := func(name, contents string) {
+		t.Helper()
+		assert.NilError(t, tw.WriteHeader(&tar.Header{
+			Name:     name,
+			Typeflag: tar.TypeReg,
+			Mode:     0o644,
+			Size:     int64(len(contents)),
+		}))
+		if contents != "" {
+			_, err := tw.Write([]byte(contents))
+			assert.NilError(t, err)
+		}
+	}
+	writeFile("dir/file1", "one")
+	writeFile(".wh.dir", "")
+	writeFile("dir/file2", "two")
+	assert.NilError(t, tw.Close())
+
+	_, err := ApplyUncompressedLayer(dest, &buf, &TarOptions{NoLchown: true})
+	assert.NilError(t, err)
+
+	_, err = os.Stat(filepath.Join(dest, "dir", "file1"))
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	dt, err := os.ReadFile(filepath.Join(dest, "dir", "file2"))
+	assert.NilError(t, err)
+	assert.Equal(t, string(dt), "two")
+}
+
+func TestUnpackRecreatesImpliedDirectoryRemovedBetweenEntries(t *testing.T) {
+	tarData := makeTarWithFiles(t, "dir", 2)
+
+	for _, tc := range []struct {
+		name   string
+		unpack func(io.Reader, string) error
+	}{
+		{
+			name: "Unpack",
+			unpack: func(r io.Reader, dest string) error {
+				return Unpack(r, dest, &TarOptions{NoLchown: true})
+			},
+		},
+		{
+			name: "UnpackLayer",
+			unpack: func(r io.Reader, dest string) error {
+				_, err := UnpackLayer(dest, r, &TarOptions{NoLchown: true})
+				return err
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dest := t.TempDir()
+			r := newPausedReader(tarData, 2*tarBlockSize)
+			defer r.Resume()
+
+			errCh := make(chan error, 1)
+			go func() {
+				errCh <- tc.unpack(r, dest)
+			}()
+
+			select {
+			case <-r.Paused():
+			case err := <-errCh:
+				t.Fatalf("unpack returned before the second entry: %v", err)
+			}
+			_, err := os.Stat(filepath.Join(dest, "dir", "file-0"))
+			assert.NilError(t, err)
+			assert.NilError(t, os.RemoveAll(filepath.Join(dest, "dir")))
+			r.Resume()
+
+			assert.NilError(t, <-errCh)
+			data, err := os.ReadFile(filepath.Join(dest, "dir", "file-1"))
+			assert.NilError(t, err)
+			assert.Equal(t, string(data), "fooo")
+		})
+	}
+}
+
+const tarBlockSize = 512
+
+type pausedReader struct {
+	data       []byte
+	pauseAt    int
+	pos        int
+	paused     chan struct{}
+	resume     chan struct{}
+	pauseOnce  sync.Once
+	resumeOnce sync.Once
+}
+
+func newPausedReader(data []byte, pauseAt int) *pausedReader {
+	return &pausedReader{
+		data:    data,
+		pauseAt: pauseAt,
+		paused:  make(chan struct{}),
+		resume:  make(chan struct{}),
+	}
+}
+
+func (r *pausedReader) Read(p []byte) (int, error) {
+	if r.pos == len(r.data) {
+		return 0, io.EOF
+	}
+	if r.pos >= r.pauseAt {
+		r.pauseOnce.Do(func() { close(r.paused) })
+		<-r.resume
+	}
+	if r.pos < r.pauseAt && r.pos+len(p) > r.pauseAt {
+		p = p[:r.pauseAt-r.pos]
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	return n, nil
+}
+
+func (r *pausedReader) Paused() <-chan struct{} {
+	return r.paused
+}
+
+func (r *pausedReader) Resume() {
+	r.resumeOnce.Do(func() { close(r.resume) })
 }
 
 func TestUntarHardlinkToSymlink(t *testing.T) {
@@ -1294,4 +1449,29 @@ func readFileFromArchive(t *testing.T, archive io.ReadCloser, name string, expec
 	content, err := os.ReadFile(filepath.Join(destDir, name))
 	assert.Check(t, err)
 	return string(content)
+}
+
+func makeTarWithFiles(tb testing.TB, parent string, numberOfFiles int) []byte {
+	tb.Helper()
+
+	fileData := []byte("fooo")
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for n := range numberOfFiles {
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     fmt.Sprintf("%s/file-%d", parent, n),
+			Typeflag: tar.TypeReg,
+			Mode:     0o700,
+			Size:     int64(len(fileData)),
+		}); err != nil {
+			tb.Fatal(err)
+		}
+		if _, err := tw.Write(fileData); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		tb.Fatal(err)
+	}
+	return buf.Bytes()
 }

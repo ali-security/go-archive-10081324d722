@@ -110,7 +110,7 @@ func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64,
 		}
 		dstPath := resolvedPath.path
 		// Ensure that the parent directory exists.
-		if err := createImpliedDirectories(root, dstPath, options); err != nil {
+		if err := createImpliedDirectories(root, resolvedPath, options); err != nil {
 			return 0, err
 		}
 		if base := filepath.Base(dstPath); strings.HasPrefix(base, WhiteoutPrefix) {
