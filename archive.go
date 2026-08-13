@@ -453,6 +453,10 @@ func (ta *tarAppender) addTarFile(srcPath, archivePath string) error {
 	return nil
 }
 
+type resolvedArchivePath struct {
+	path string
+}
+
 // resolveArchivePath resolves intermediate symlinks in name using chroot-like
 // semantics when os.Root cannot traverse them. The final path component is
 // intentionally preserved because archive extraction may create or replace it.
@@ -469,10 +473,10 @@ func (ta *tarAppender) addTarFile(srcPath, archivePath string) error {
 // This helper should eventually be replaced by handle-relative resolution and
 // operations with resolve-in-root semantics, avoiding the resolution/use race
 // and repeated path traversal.
-func resolveArchivePath(root *os.Root, name string) (string, error) {
+func resolveArchivePath(root *os.Root, name string) (resolvedArchivePath, error) {
 	parent, base := filepath.Split(name)
 	if parent == "" {
-		return name, nil
+		return resolvedArchivePath{path: name}, nil
 	}
 
 	parent = filepath.Clean(parent)
@@ -482,9 +486,9 @@ func resolveArchivePath(root *os.Root, name string) (string, error) {
 	_, statErr := root.Stat(parent)
 	switch {
 	case statErr == nil:
-		return name, nil
+		return resolvedArchivePath{path: name}, nil
 	case !os.IsNotExist(statErr) && !isPathEscapes(statErr):
-		return "", statErr
+		return resolvedArchivePath{}, statErr
 	}
 
 	// Resolve the parent both to handle ENOENT from missing components or dangling
@@ -492,16 +496,16 @@ func resolveArchivePath(root *os.Root, name string) (string, error) {
 	// absolute symlink. Relative symlink escapes preserve the original Stat error.
 	resolved, err := resolveFSRootPath(root.Name(), parent)
 	if err != nil {
-		return "", err
+		return resolvedArchivePath{}, err
 	}
 
 	if isPathEscapes(statErr) && (!resolved.followedAbsoluteLink || resolved.relativeEscapeBeforeAbsolute) {
-		return "", statErr
+		return resolvedArchivePath{}, statErr
 	}
 
 	relParent, err := filepath.Rel(root.Name(), resolved.path)
 	if err != nil {
-		return "", breakoutError(fmt.Errorf(
+		return resolvedArchivePath{}, breakoutError(fmt.Errorf(
 			"could not make resolved parent %q relative to root %q: %w",
 			resolved.path,
 			root.Name(),
@@ -509,14 +513,14 @@ func resolveArchivePath(root *os.Root, name string) (string, error) {
 		))
 	}
 	if relParent != "." && !filepath.IsLocal(relParent) {
-		return "", breakoutError(fmt.Errorf(
+		return resolvedArchivePath{}, breakoutError(fmt.Errorf(
 			"resolved parent %q escapes root %q",
 			resolved.path,
 			root.Name(),
 		))
 	}
 
-	return filepath.Join(relParent, base), nil
+	return resolvedArchivePath{path: filepath.Join(relParent, base)}, nil
 }
 
 // resolveHardlinkTarget validates a POSIX hardlink target and resolves it to
@@ -534,7 +538,11 @@ func resolveHardlinkTarget(root *os.Root, linkname string) (string, error) {
 	if cleaned == "." || !filepath.IsLocal(cleaned) {
 		return "", breakoutError(fmt.Errorf("invalid hardlink target %q", linkname))
 	}
-	return resolveArchivePath(root, filepath.FromSlash(cleaned))
+	resolved, err := resolveArchivePath(root, filepath.FromSlash(cleaned))
+	if err != nil {
+		return "", err
+	}
+	return resolved.path, nil
 }
 
 // createTarFile extracts a single tar entry into the given root. dstPath is the
@@ -1034,10 +1042,11 @@ loop:
 		// dstPath is the native (host-separator) form of the entry name,
 		// used at all filesystem boundaries (os.Root methods, fsRootPath).
 		// hdr.Name stays POSIX (forward-slash) for logical string checks.
-		dstPath, err := resolveArchivePath(root, filepath.FromSlash(hdr.Name))
+		resolvedPath, err := resolveArchivePath(root, filepath.FromSlash(hdr.Name))
 		if err != nil {
 			return err
 		}
+		dstPath := resolvedPath.path
 
 		// If dstPath exists we almost always just want to remove and replace it.
 		// The only exception is when it is a directory *and* the file from
