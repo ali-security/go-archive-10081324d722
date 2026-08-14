@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -675,22 +674,27 @@ func createTarFile(root *os.Root, dstPath string, hdr *tar.Header, reader io.Rea
 		}
 	}
 
-	var xattrErrs []string
-	absPath := sync.OnceValues(func() (string, error) {
-		return fsRootPath(root.Name(), dstPath)
-	})
+	var (
+		xattrErrs         []string
+		xattrPath         string
+		resolvedXattrPath bool
+	)
 	for key, value := range hdr.PAXRecords {
 		xattr, ok := strings.CutPrefix(key, paxSchilyXattr)
 		if !ok {
 			continue
 		}
+		if !resolvedXattrPath {
+			var err error
+			xattrPath, err = fsRootPath(root.Name(), dstPath)
+			if err != nil {
+				return err
+			}
+			resolvedXattrPath = true
+		}
 		// os.Root has no xattr support; use the absolute path derived from
 		// the root so the path remains bounded.
-		ap, err := absPath()
-		if err != nil {
-			return err
-		}
-		if err := lsetxattr(ap, xattr, []byte(value), 0); err != nil {
+		if err := lsetxattr(xattrPath, xattr, []byte(value), 0); err != nil {
 			if bestEffortXattrs && errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EPERM) {
 				// EPERM occurs if modifying xattrs is not allowed. This can
 				// happen when running in userns with restrictions (ChromeOS).
