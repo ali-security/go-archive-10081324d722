@@ -104,12 +104,13 @@ func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64,
 		// dstPath is the native (host-separator) form of the entry name,
 		// used at all filesystem boundaries (os.Root methods, fsRootPath).
 		// The tar-header name (hdr.Name) is POSIX, so convert it here.
-		dstPath, err := resolveArchivePath(root, filepath.FromSlash(hdr.Name))
+		resolvedPath, err := resolveArchivePath(root, filepath.FromSlash(hdr.Name))
 		if err != nil {
 			return 0, err
 		}
+		dstPath := resolvedPath.path
 		// Ensure that the parent directory exists.
-		if err := createImpliedDirectories(root, dstPath, options); err != nil {
+		if err := createImpliedDirectories(root, resolvedPath, options); err != nil {
 			return 0, err
 		}
 		if base := filepath.Base(dstPath); strings.HasPrefix(base, WhiteoutPrefix) {
