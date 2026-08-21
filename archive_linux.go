@@ -7,9 +7,27 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/moby/go-archive/internal/archiveoptions"
 	"github.com/moby/sys/userns"
 	"golang.org/x/sys/unix"
 )
+
+func withProcSelfFD(opts *TarOptions) (*TarOptions, func(), error) {
+	procSelfFD, err := os.Open("/proc/self/fd")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var prepared TarOptions
+	if opts != nil {
+		prepared = *opts
+	}
+	prepared.internalOptions = &archiveoptions.Options{
+		ProcSelfFD: procSelfFD,
+	}
+
+	return &prepared, func() { _ = procSelfFD.Close() }, nil
+}
 
 func getWhiteoutConverter(format WhiteoutFormat) tarWhiteoutConverter {
 	if format == OverlayWhiteoutFormat {
@@ -68,40 +86,79 @@ func (overlayWhiteoutConverter) ConvertWrite(hdr *tar.Header, path string, fi os
 	}, nil
 }
 
-func (c overlayWhiteoutConverter) ConvertRead(hdr *tar.Header, path string) (bool, error) {
-	base := filepath.Base(path)
-	dir := filepath.Dir(path)
+// ConvertRead converts an AUFS-format whiteout entry to the overlay format.
+// All filesystem operations are performed relative to a directory handle
+// opened through root, so that symlinks in the destination tree cannot
+// redirect them outside of it.
+func (c overlayWhiteoutConverter) ConvertRead(root *os.Root, hdr *tar.Header, filePath string) (bool, error) {
+	base := filepath.Base(filePath)
+	dir := filepath.Dir(filePath)
 
-	// if a directory is marked as opaque by the AUFS special file, we need to translate that to overlay
-	if base == WhiteoutOpaqueDir {
+	switch base {
+	case WhiteoutPrefix, WhiteoutPrefix + ".", WhiteoutPrefix + "..":
+		return false, fmt.Errorf("invalid whiteout entry %q", hdr.Name)
+
+	case WhiteoutOpaqueDir:
 		opaqueXattrName := "trusted.overlay.opaque"
 		if userns.RunningInUserNS() {
 			opaqueXattrName = "user.overlay.opaque"
 		}
 
-		err := unix.Setxattr(dir, opaqueXattrName, []byte{'y'}, 0)
+		parent, err := root.Open(dir)
 		if err != nil {
-			return false, fmt.Errorf("setxattr('%s', %s=y): %w", dir, opaqueXattrName, err)
-		}
-		// don't write the file itself
-		return false, err
-	}
-
-	// if a file was deleted and we are using overlay, we need to create a character device
-	if strings.HasPrefix(base, WhiteoutPrefix) {
-		originalBase := base[len(WhiteoutPrefix):]
-		originalPath := filepath.Join(dir, originalBase)
-
-		if err := unix.Mknod(originalPath, unix.S_IFCHR, 0); err != nil {
-			return false, fmt.Errorf("failed to mknod('%s', S_IFCHR, 0): %w", originalPath, err)
-		}
-		if err := os.Chown(originalPath, hdr.Uid, hdr.Gid); err != nil {
 			return false, err
 		}
+		defer parent.Close()
 
-		// don't write the file itself
+		// If a directory is marked as opaque by the AUFS special file, we need to translate that to overlay.
+		// #nosec G115 -- ignore integer overflow conversion for parent.Fd
+		if err := unix.Fsetxattr(int(parent.Fd()), opaqueXattrName, []byte{'y'}, 0); err != nil {
+			return false, fmt.Errorf("fsetxattr('%s', %s=y): %w", dir, opaqueXattrName, err)
+		}
+		// Don't write the whiteout file itself.
+		return false, nil
+
+	default:
+		originalBase, ok := strings.CutPrefix(base, WhiteoutPrefix)
+		if !ok {
+			// Regular file.
+			return true, nil
+		}
+
+		parent, err := root.Open(dir)
+		if err != nil {
+			return false, err
+		}
+		defer parent.Close()
+
+		// If a file was deleted, and we are using overlay, we need to create a character device.
+		originalPath := filepath.Join(dir, originalBase)
+		// #nosec G115 -- ignore integer overflow conversion for parent.Fd
+		if err := unix.Mknodat(int(parent.Fd()), originalBase, unix.S_IFCHR, 0); err != nil {
+			return false, fmt.Errorf("failed to mknod('%s', S_IFCHR, 0): %w", originalPath, err)
+		}
+
+		// Header IDs have already been remapped. Optimize the common non-remapped
+		// root-owned (0:0) case by assuming the created whiteout has the expected
+		// ownership, rather than comparing against the effective UID/GID or stat'ing
+		// the created node to verify it.
+		if hdr.Uid != 0 || hdr.Gid != 0 {
+			// TODO(thaJeztah): Revisit whether whiteout ownership needs to be preserved.
+			//
+			// This was added in the original overlay whiteout implementation:
+			// https://github.com/moby/moby/pull/18560 / https://github.com/moby/moby/pull/22126
+			//
+			// OverlayFS documents whiteouts in terms of a character device with device
+			// number 0:0, not ownership: https://docs.kernel.org/filesystems/overlayfs.html#whiteouts-and-opaque-directories
+			//
+			// If ownership is not required, this Fchownat can be removed to avoid the remaining TOCTOU window.
+			// #nosec G115 -- ignore integer overflow conversion for parent.Fd
+			if err := unix.Fchownat(int(parent.Fd()), originalBase, hdr.Uid, hdr.Gid, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+				return false, &os.PathError{Op: "lchown", Path: originalPath, Err: err}
+			}
+		}
+
+		// Don't write the whiteout file itself.
 		return false, nil
 	}
-
-	return true, nil
 }

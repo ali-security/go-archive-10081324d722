@@ -17,7 +17,7 @@ jobs:
       fail-fast: false
       matrix:
         go-version:
-          - 1.23.x      # oldest supported (see go.mod)
+          - 1.25.x      # oldest supported (see go.mod)
           - oldstable
           - stable
         os: [ubuntu-latest, windows-latest, macos-latest]
@@ -31,13 +31,18 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
 
-      # golangci-lint v2.7 (upstream's pin) was built against an older Go and
-      # cannot typecheck the Go 1.27 stdlib that `stable` now resolves to:
-      # "export data version 4 is greater than maximum supported version 2".
-      # Lint is therefore scoped to the Go releases the pinned linter supports;
-      # the test steps below still run on every matrix leg.
+      # golangci-lint v2.7 (upstream's pin) is itself built with Go 1.25, so it
+      # cannot typecheck sources newer than that:
+      #   - on `stable` (Go 1.27) the stdlib export data is unreadable:
+      #     "export data version 4 is greater than maximum supported version 2"
+      #   - on `oldstable` (Go 1.26) with GOOS=windows, sequential_windows_go126.go
+      #     (//go:build windows && go1.26) makes go/types panic with
+      #     "file requires newer Go version go1.26 (application built with go1.25)"
+      # Lint is therefore scoped to the Go release the pinned linter supports; it
+      # still runs on all three operating systems, and the test steps below still
+      # run on every matrix leg.
       - name: lint
-        if: matrix.go-version != 'stable'
+        if: matrix.go-version == '1.25.x'
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.7
